@@ -1,196 +1,202 @@
 import random
 from math import ceil, exp
 from pathlib import Path
+import inspect
 
-class CANComponent:
-    """Represents a single CAN network component."""
+class Message:
+    """Represents a CAN message with its priority, transmission time, and period."""
     def __init__(self, data: list):
+        # data is expected to be a list: [priority, trans_time, period]
         self.priority = int(data[0])
         self.trans_time = float(data[1])
         self.period = int(data[2])
     
     def display(self) -> None:
-        print(f"Priority = {self.priority:2d}, Trans Time = {self.trans_time:.3f}, Period = {self.period:4d}")
+        print(f"priority = {self.priority:2d}, trans_time = {self.trans_time:.3f}, period = {self.period:4d}.")
 
-class CANNetwork:
-    """Simulates a CAN network and computes worst-case response times."""
+class CANController:
+    """Handles scheduling of CAN messages."""
     def __init__(self, tau: float):
-        self.tau = tau
-        self.components = []  # instance variable for components
+        self.tau = tau  # transmission time of one bit
+        self.messages = []  # list of Message objects
 
-    def add_component(self, comp: CANComponent) -> None:
-        self.components.append(comp)
+    def add_message(self, msg: Message) -> None:
+        self.messages.append(msg)
     
-    def get_max_blocking(self, index: int) -> float:
-        """Returns the maximum transmission time among components with priority 
-           equal or higher than the component at the given index."""
-        current_priority = self.components[index].priority
-        return max((comp.trans_time for comp in self.components 
-                    if comp.priority >= current_priority), default=0)
-
-    def calculate_waiting_time(self, index: int) -> float:
-        """Iteratively computes the waiting time for the component at index."""
-        comp = self.components[index]
-        base = self.get_max_blocking(index)
-        waiting = base
+    def get_longest_blocking(self, idx: int) -> float:
+        """Returns the largest transmission time among messages whose priority is
+        greater than or equal to that of the message at index idx."""
+        current_priority = self.messages[idx].priority
+        return max((m.trans_time for m in self.messages if m.priority >= current_priority), default=0)
+    
+    def get_waiting_time(self, idx: int) -> float:
+        """Computes the waiting time for message at idx using an iterative method.
+        Returns 0 if the message is not schedulable."""
+        msg = self.messages[idx]
+        current_priority = msg.priority
+        block = self.get_longest_blocking(idx)
+        wt = block
         while True:
-            interference = base
-            for other in self.components:
-                if other.priority < comp.priority:
-                    interference += other.trans_time * ceil((waiting + self.tau) / other.period)
-            if interference + comp.trans_time > comp.period:
-                return 0  # unschedulable
-            if waiting == interference:
-                return waiting
-            waiting = interference
+            rhs = block
+            for m in self.messages:
+                if m.priority < current_priority:
+                    rhs += m.trans_time * ceil((wt + self.tau) / m.period)
+            if rhs + msg.trans_time > msg.period:
+                return 0
+            if abs(wt - rhs) < 1e-9:  # convergence check
+                return wt
+            wt = rhs
 
-    def worst_case_response_time(self, index: int, do_print: bool = False) -> float:
-        """Returns the worst-case response time for the component at index."""
-        wait_time = self.calculate_waiting_time(index)
-        if wait_time == 0:
+    def compute_single_wcrt(self, idx: int, do_print: bool = False) -> float:
+        """Computes and (optionally) prints the worst-case response time for one message.
+        Returns -1 if not schedulable."""
+        wt = self.get_waiting_time(idx)
+        if wt == 0:
             if do_print:
                 print("ERROR: non-schedulable")
             return -1
-        response_time = wait_time + self.components[index].trans_time
+        wcrt = wt + self.messages[idx].trans_time
         if do_print:
-            print(response_time)
-        return response_time
+            print(wcrt)
+        return wcrt
 
-    def total_response_time(self, do_print: bool = False) -> tuple:
-        """Computes the total response time and counts unschedulable components."""
-        total_rt, unschedulable = 0, 0
-        for i in range(len(self.components)):
-            rt = self.worst_case_response_time(i, do_print)
+    def print_wcrt(self) -> tuple:
+        """Prints the worst-case response time for each message (one per line)
+        and then prints the total cost (objective value)."""
+        total, non_sched = 0, 0
+        for i in range(len(self.messages)):
+            rt = self.compute_single_wcrt(i, do_print=True)
             if rt < 0:
-                unschedulable += 1
+                non_sched += 1
             else:
-                total_rt += rt
+                total += rt
+        print(total)
+        return total, non_sched
+
+    def compute_total_wcrt(self) -> tuple:
+        """Returns the total worst-case response time and the count of unschedulable messages."""
+        total, non_sched = 0, 0
+        for i in range(len(self.messages)):
+            rt = self.compute_single_wcrt(i)
+            if rt < 0:
+                non_sched += 1
+            else:
+                total += rt
+        return total, non_sched
+
+    def get_cost(self, seq: list[int] = None, penalty: int = 0, do_print: bool = False) -> tuple:
+        """If a sequence is provided, updates the message priorities accordingly.
+        Then computes cost as total worst-case response time plus penalty for each unschedulable message."""
+        if seq is not None:
+            self.update_priorities(seq)
+        total, non_sched = self.compute_total_wcrt()
+        cost = total + non_sched * penalty
         if do_print:
-            print(total_rt)
-        return total_rt, unschedulable
+            print(cost)
+        return cost, (non_sched == 0)
 
-    def cost(self, sequence: list[int] = None, penalty: float = 0, do_print: bool = False) -> tuple:
-        """
-        Calculates a cost value based on the total worst-case response time.
-        Optionally updates the priority sequence and applies a penalty for each 
-        unschedulable component.
-        """
-        if sequence is not None:
-            self.set_priority_sequence(sequence)
-        total_rt, unsched = self.total_response_time(do_print)
-        total_rt += unsched * penalty
-        schedulable = (unsched == 0)
-        return total_rt, schedulable
+    def update_priorities(self, seq: list[int]) -> None:
+        """Updates each message’s priority using the given sequence."""
+        for msg, p in zip(self.messages, seq):
+            msg.priority = p
 
-    def set_priority_sequence(self, seq: list[int]) -> None:
-        """Sets the priorities of components based on the provided sequence."""
-        for comp, pr in zip(self.components, seq):
-            comp.priority = pr
-
-    def sort_by_priority(self) -> None:
-        """Sorts components in ascending order by their priority."""
-        self.components.sort(key=lambda comp: comp.priority)
+    def sort_messages(self) -> None:
+        """Sorts messages by their priority (ascending)."""
+        self.messages.sort(key=lambda m: m.priority)
 
     def display(self) -> None:
+        """Prints the tau value and details for all messages."""
         print("tau =", self.tau)
-        for comp in self.components:
-            comp.display()
+        for m in self.messages:
+            m.display()
 
 def load_data(filepath: Path, debug: bool = False) -> tuple:
     """
-    Reads network data from a file and returns a CANNetwork instance 
-    along with the number of components.
+    Reads data from the file.
+    Expected file format:
+      - First line: number of messages
+      - Second line: tau (transmission time of one bit)
+      - Following lines: each line contains priority, transmission time, period
     """
-    with open(filepath, 'r') as file:
-        num_comps = int(file.readline().strip())
-        tau = float(file.readline().strip())
-        network = CANNetwork(tau)
-        comp_data = []
-        for _ in range(num_comps):
-            parts = file.readline().strip().split()
-            comp_data.append(parts)
-            network.add_component(CANComponent(parts))
+    with open(filepath, 'r') as f:
+        num = int(f.readline().strip())
+        tau = float(f.readline().strip())
+        controller = CANController(tau)
+        comp_list = []
+        for _ in range(num):
+            parts = f.readline().strip().split()
+            comp_list.append(parts)
+            controller.add_message(Message(parts))
     if debug:
-        print("Number of components:", num_comps)
-        print("tau:", tau)
-        print("Component data:", comp_data)
-    return network, num_comps
+        print("num =", num)
+        print("tau =", tau)
+        print("comp_list =", comp_list)
+    return controller, num
 
-def get_two_random_indices(min_val: int, max_val: int) -> tuple:
-    """Returns two distinct random indices between min_val and max_val (inclusive)."""
-    i = random.randint(min_val, max_val)
-    j = i
-    while j == i:
-        j = random.randint(min_val, max_val)
-    return i, j
-
-def swap_elements(seq: list, i: int, j: int) -> list:
-    """Returns a new list with the elements at indices i and j swapped."""
+def swap_list(seq: list, i: int, j: int) -> list:
+    """Returns a new list with elements at positions i and j swapped."""
     new_seq = seq.copy()
     new_seq[i], new_seq[j] = new_seq[j], new_seq[i]
     return new_seq
 
-def simulated_annealing(network: CANNetwork, num_comps: int, T_start: float, T_frozen: float, cooling_ratio: float) -> list[int]:
-    """Performs a simulated annealing (SA) search to minimize the network cost."""
-    print("Starting simulated annealing for CAN network...")
-    print(f"SA parameters | Start Temp: {T_start}, Frozen Temp: {T_frozen}, Cooling Ratio: {cooling_ratio}")
-
+def simulated_annealing(controller: CANController, n: int, T_start: float, T_end: float, cooling: float) -> list[int]:
+    """Performs a simulated annealing search to (greedily) improve the cost.
+    Prints progress messages similar to the original."""
+    print("CAN SA starting...")
+    print(f"SA | Temp start: {T_start}, frozen: {T_end}, ratio: {cooling}")
+    constant = 100000
     penalty = 150
     T = T_start
-
-    current_seq = [comp.priority for comp in network.components]
+    current_seq = [m.priority for m in controller.messages]
     best_seq = current_seq.copy()
-
-    while T > T_frozen:
-        i, j = get_two_random_indices(0, num_comps - 1)
-        neighbor_seq = swap_elements(current_seq, i, j)
-
-        cost_current, _ = network.cost(sequence=current_seq, penalty=penalty)
-        cost_neighbor, feasible = network.cost(sequence=neighbor_seq, penalty=penalty)
-        cost_best, _ = network.cost(sequence=best_seq, penalty=penalty)
-
-        print(f"\rcost | best: {cost_best}", end='')
-
-        cost_diff = cost_neighbor - cost_current
-
-        if feasible and cost_neighbor < cost_best:
-            best_seq = neighbor_seq
-
-        if cost_diff <= 0:
-            current_seq = neighbor_seq
+    
+    while T > T_end:
+        i, j = random.sample(range(n), 2)
+        candidate = swap_list(current_seq, i, j)
+        cost_current, _ = controller.get_cost(seq=current_seq, penalty=penalty)
+        cost_candidate, feasible = controller.get_cost(seq=candidate, penalty=penalty)
+        cost_best, _ = controller.get_cost(seq=best_seq, penalty=penalty)
+        print(f"\rcost | s*: {cost_best}", end='')
+        diff = cost_candidate - cost_current
+        if feasible and cost_candidate < cost_best:
+            best_seq = candidate.copy()
+        if diff <= 0:
+            current_seq = candidate.copy()
         else:
-            # Standard SA acceptance condition.
-            if random.random() < exp(-cost_diff / T):
-                current_seq = neighbor_seq
-
-        T *= cooling_ratio
-
-    print("\nSimulated annealing completed.")
-    if not network.cost(sequence=best_seq)[1]:
-        print("ERROR: non-schedulable, potential SA failure.")
+            prob = random.uniform(0, 1)
+            if constant * prob < prob * exp(-diff / T):
+                current_seq = candidate.copy()
+        T *= cooling
+    print()
+    print("CAN SA was done")
+    if not controller.get_cost(seq=best_seq)[1]:
+        print("ERROR: non-schedulable, potential fail in SA.")
+    print()
     return best_seq
 
-# --- Main execution ---
-DEBUG = False
-FILE_PATH = 'input.dat'
-
 def main():
-    network, num_comps = load_data(Path(FILE_PATH), DEBUG)
-
-    if DEBUG:
-        network.display()
-
-    orig_cost, _ = network.cost()
-    print(f"Original cost: {orig_cost}")
-
-    best_seq = simulated_annealing(network, num_comps, T_start=2, T_frozen=1, cooling_ratio=0.999)
-    network.set_priority_sequence(best_seq)
-    network.sort_by_priority()
-    network.cost(do_print=True)
-
+    controller, n = load_data(Path('input.dat'), debug=False)
+    # Print the original cost (objective value)
+    orig_cost, _ = controller.get_cost()
+    print("original cost:", orig_cost)
+    
+    # Run simulated annealing to search for a better priority assignment
+    best_sequence = simulated_annealing(controller, n, 2, 1, 0.999)
+    
+    # Update priorities to the best found solution and sort messages accordingly
+    controller.update_priorities(best_sequence)
+    controller.sort_messages()
+    
+    # Print each message's worst-case response time (one per line) and then the total
+    controller.print_wcrt()
     print()
-    network.display()
-    print("Best priority sequence:", best_seq)
+    
+    # Print CAN details (including tau and each message’s info)
+    controller.display()
+    
+    # Print the final priority sequence as a list
+    print(best_sequence)
+   
 
 if __name__ == '__main__':
     main()
